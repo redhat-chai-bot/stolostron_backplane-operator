@@ -1038,3 +1038,85 @@ func TestEnsureTLSProfileConfigMaps(t *testing.T) {
 		})
 	}
 }
+
+// TestAssistedServicePostgresImageOverrides verifies that DATABASE_IMAGE and
+// DATABASE_IMAGE_PG13 env vars in the infrastructure-operator deployment each
+// render through their own distinct global.imageOverrides key.  Using separate
+// override values for postgresql_13 and postgresql_15 ensures a swapped or
+// shared key would be caught.  Regression coverage for
+// stolostron/backplane-operator#4214.
+func TestAssistedServicePostgresImageOverrides(t *testing.T) {
+	t.Setenv("DIRECTORY_OVERRIDE", "../../")
+	t.Setenv("ACM_HUB_OCP_VERSION", "4.12.0")
+
+	const (
+		pg13Image = "quay.io/test/pg13:override"
+		pg15Image = "quay.io/test/pg15:override"
+		fallback  = "quay.io/test/default:Test"
+	)
+
+	testImages := map[string]string{}
+	for _, v := range utils.GetTestImages() {
+		testImages[v] = fallback
+	}
+	// Assign distinct values so a swapped key is detectable.
+	testImages["postgresql_13"] = pg13Image
+	testImages["postgresql_15"] = pg15Image
+
+	mce := &backplane.MultiClusterEngine{
+		ObjectMeta: metav1.ObjectMeta{Name: "testBackplane"},
+		Spec: backplane.MultiClusterEngineSpec{
+			TargetNamespace: "default",
+		},
+	}
+
+	templates, errs := RenderChart(
+		"pkg/templates/charts/toggle/assisted-service",
+		mce,
+		testImages,
+		map[string]string{},
+	)
+	if len(errs) > 0 {
+		t.Fatalf("failed to render assisted-service chart: %v", errs)
+	}
+
+	var infraDeploy *appsv1.Deployment
+	for _, tmpl := range templates {
+		if tmpl.GetKind() == "Deployment" && tmpl.GetName() == "infrastructure-operator" {
+			infraDeploy = &appsv1.Deployment{}
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(tmpl.Object, infraDeploy); err != nil {
+				t.Fatalf("unmarshal infrastructure-operator deployment: %v", err)
+			}
+			break
+		}
+	}
+	if infraDeploy == nil {
+		t.Fatal("infrastructure-operator deployment was not rendered")
+	}
+
+	envMap := map[string]string{}
+	for _, e := range infraDeploy.Spec.Template.Spec.Containers[0].Env {
+		envMap[e.Name] = e.Value
+	}
+
+	// DATABASE_IMAGE (PG15, primary) must resolve to the postgresql_15 override.
+	if v, ok := envMap["DATABASE_IMAGE"]; !ok {
+		t.Fatal("DATABASE_IMAGE env var is missing from infrastructure-operator")
+	} else if v != pg15Image {
+		t.Errorf("DATABASE_IMAGE = %q; want %q (global.imageOverrides.postgresql_15)", v, pg15Image)
+	}
+
+	// DATABASE_IMAGE_PG13 must resolve to the postgresql_13 override — regression guard.
+	if v, ok := envMap["DATABASE_IMAGE_PG13"]; !ok {
+		t.Fatal("DATABASE_IMAGE_PG13 env var is missing from infrastructure-operator")
+	} else if v != pg13Image {
+		t.Errorf("DATABASE_IMAGE_PG13 = %q; want %q (global.imageOverrides.postgresql_13, not a hardcoded pullspec)", v, pg13Image)
+	}
+
+	// DATABASE_IMAGE_VERSION is a plain string, not an image — verify it's present.
+	if v, ok := envMap["DATABASE_IMAGE_VERSION"]; !ok {
+		t.Fatal("DATABASE_IMAGE_VERSION env var is missing from infrastructure-operator")
+	} else if v != "15" {
+		t.Errorf("DATABASE_IMAGE_VERSION = %q; want %q", v, "15")
+	}
+}
